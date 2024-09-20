@@ -5,6 +5,10 @@ from tqdm import trange
 import torch
 import torch.nn as nn
 import math
+from typing import Optional
+from pathlib import Path
+import os
+import d4rl
 
 
 Batch = collections.namedtuple(
@@ -76,7 +80,7 @@ def reward_from_preference(
     reward_model,
     batch_size: int = 256,
     reward_model_type: str = "transformer",
-    device="cuda"
+    device="cpu"
 ):
     data_size = dataset["rewards"].shape[0]
     interval = int(data_size / batch_size) + 1
@@ -134,6 +138,154 @@ def reward_from_preference(
     
     # print(rr_n_bins)
     # print(fr_n_bins)
+    
+    return dataset
+
+@torch.no_grad()
+def replace_dataset_reward(
+    dataset: D4RLDataset,
+    reward_models,
+    reward_model_types,
+    batch_size: int = 256,
+    device="cuda"
+):
+    """
+    For each reward model, estimate rewards for all state-action pairs in the dataset.
+    Normalize these rewards independently to a range of 0 to 1. 
+    Then, combine the normalized rewards into a single reward signal using linear interpolation.
+    Finally, replace the original rewards with this new signal.
+    """
+    if len(reward_models) == 0:
+        return dataset
+
+    data_size = dataset["rewards"].shape[0]
+    interval = int(data_size / batch_size) + 1
+    new_r = np.zeros((len(reward_models),) + dataset["rewards"].shape)
+    
+    for n, (reward_model, reward_model_type) in enumerate(zip(reward_models, reward_model_types)):
+        if reward_model_type == "transformer":
+            max_seq_len = reward_model.max_seq_len
+            for each in reward_model.ensemble:
+                each.eval()
+    
+            obs, act = [], []
+            ptr = 0
+            for i in trange(data_size):
+                
+                if len(obs) < max_seq_len:
+                    obs.append(dataset["observations"][i])
+                    act.append(dataset["actions"][i])
+                
+                if dataset["terminals"][i] > 0 or i == data_size - 1 or len(obs) == max_seq_len:
+                    tensor_obs = to_torch(np.array(obs)[None,], dtype=torch.float32).to(device)
+                    tensor_act = to_torch(np.array(act)[None,], dtype=torch.float32).to(device)
+                    
+                    new_reward = 0
+                    for each in reward_model.ensemble:
+                        new_reward += each(tensor_obs, tensor_act).detach().cpu().numpy()
+                    new_reward /= len(reward_model.ensemble)
+                    if tensor_obs.shape[1] <= -1:
+                        new_r[n][ptr:ptr+tensor_obs.shape[1]] = dataset["rewards"][ptr:ptr+tensor_obs.shape[1]]
+                    else:
+                        new_r[n][ptr:ptr+tensor_obs.shape[1]] = new_reward
+                    ptr += tensor_obs.shape[1]
+                    obs, act = [], []
+        else:
+            for i in trange(interval):
+                start_pt = i * batch_size
+                end_pt = (i + 1) * batch_size
+
+                observations = dataset["observations"][start_pt:end_pt]
+                actions = dataset["actions"][start_pt:end_pt]
+                obs_act = np.concatenate([observations, actions], axis=-1)
+
+                new_reward = reward_model.get_reward_batch(obs_act).reshape(-1)
+                new_r[n][start_pt:end_pt] = new_reward
+
+    # map rewards to [0, 1] for each reward model independently
+    new_r = MinMaxScaler(new_r.min(axis=1), new_r.max(axis=1)).transform(new_r.T).T
+
+    # combine rewards through linear interpolation
+    new_r = new_r.mean(axis=0)
+        
+    dataset["rewards"] = new_r.copy()
+    
+    # rr = dataset["rewards"].copy()
+    # fr = new_r.copy()
+    
+    # rr = (rr-rr.min())/(rr.max()-rr.min())
+    # fr = (fr-fr.min())/(fr.max()-fr.min())
+    
+    # rr_n_bins, _ = np.histogram(rr, 10, (0, 1))
+    # fr_n_bins, _ = np.histogram(fr, 10, (0, 1))
+    
+    # print(rr_n_bins)
+    # print(fr_n_bins)
+    
+    return dataset
+
+def load_reward_models(env_name, obs_dim, act_dim, reward_model_paths, device):
+    from rlhf.reward_model import RewardModel, TransformerRewardModel
+    
+    reward_models, reward_model_types = [], []
+    for reward_model_path in reward_model_paths:
+        reward_model_type = os.path.splitext(reward_model_path)[0].split('_')[-1]
+        if reward_model_type not in ['mlp', 'transformer', 'transformer1', 'transformer2', 'transformer3']:
+            print('The reward model stored in "' + reward_model_path + '" has an unsupported model type: ' + reward_model_type)
+        else:
+            if reward_model_type == 'mlp':
+                reward_model = RewardModel(env_name, obs_dim, act_dim, ensemble_size=3, lr=3e-4,
+                                        activation="tanh", logger=None, device=device)
+            elif 'transformer' in reward_model_type:
+                reward_model = TransformerRewardModel(env_name, obs_dim, act_dim, structure_type="transformer1",
+                                                    ensemble_size=3, lr=0.0003, activation="tanh",
+                                                    d_model=256, nhead=4, num_layers=1, max_seq_len=100,
+                                                    logger=None, device=device)
+            reward_model.load_model(reward_model_path)
+            reward_models.append(reward_model)
+            reward_model_types.append(reward_model_type)
+    return reward_models, reward_model_types
+
+def load_keypoint_predictor(env_name, obs_dim, act_dim, keypoint_predictor_path, device):
+    from rlhf.keypoint_prediction_model import KeypointPredictorModel
+    keypoint_predictor = KeypointPredictorModel(env_name, obs_dim, act_dim, device=device)
+    keypoint_predictor.load_model(keypoint_predictor_path)
+    return keypoint_predictor
+
+@torch.no_grad()
+def extend_dataset_observations(
+    dataset: D4RLDataset,
+    keypoint_predictor=None,
+    batch_size: int = 256,
+    device="cpu"
+):
+    """
+    Append the output of the keypoint predictor to the original states.
+    """
+    if not keypoint_predictor:
+        return dataset
+
+    data_size = dataset["observations"].shape[0]
+    interval = int(data_size / batch_size) + 1
+    new_obs = np.zeros((data_size, dataset["observations"].shape[-1] * 2))
+    new_next_obs = np.zeros((data_size, dataset["next_observations"].shape[-1] * 2))
+    
+    for i in trange(interval):
+        start_pt = i * batch_size
+        end_pt = (i + 1) * batch_size
+
+        observations = dataset["observations"][start_pt:end_pt]
+        keypoints = keypoint_predictor.predict(observations)
+        new_observations = np.concatenate((observations, keypoints), axis=-1)
+        new_obs[start_pt:end_pt] = new_observations
+
+        next_observations = dataset["next_observations"][start_pt:end_pt]
+        next_keypoints = keypoint_predictor.predict(next_observations)
+        new_next_observations = np.concatenate((next_observations, next_keypoints), axis=-1)
+        new_next_obs[start_pt:end_pt] = new_next_observations
+
+    dataset["observations"] = new_obs.copy()
+    dataset["next_observations"] = new_next_obs.copy()
     
     return dataset
 
@@ -335,3 +487,182 @@ class PrefTransformer3(nn.Module):
         
         x = self.transformer(x)[:, 1::2]
         return self.output_layer(x).squeeze(-1)
+    
+class StateOnlyPrefTransformer(nn.Module):
+    def __init__(self,
+        o_dim: int, attr_dim: int, 
+        d_model: int, nhead: int, num_layers: int):
+        super().__init__()
+        self.d_model = d_model
+        self.attr_dim = attr_dim
+        self.pos_emb = SinusoidalPosEmb(d_model)
+        self.obs_emb = nn.Sequential(
+            nn.Linear(o_dim, d_model), nn.LayerNorm(d_model))
+        self.attr_emb = nn.Parameter(torch.zeros(1, 1, d_model), requires_grad=True)
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model, nhead, d_model * 4, batch_first=True), num_layers)
+        self.out_layer = nn.Linear(d_model, attr_dim)
+        
+    def forward(self, traj: torch.Tensor):
+        batch_size, traj_len = traj.shape[:2]
+        pos = self.pos_emb(torch.arange(traj_len, device=traj.device))[None,]
+        obs = self.obs_emb(traj)
+        x = self.transformer(torch.cat([obs+pos, self.attr_emb.repeat(batch_size,1,1)], 1))
+        return self.out_layer(x[:, -1])
+    
+class AttrFunc(nn.Module):
+    def __init__(self, 
+        o_dim: int, attr_dim: int,
+        attr_clip: float = 20., ensemble_size: int = 3,
+        lr: float = 1e-4, weight_decay: float = 1e-4,
+        d_model: int = 128, nhead: int = 4, num_layers: int = 2, normalizer=None):
+        super().__init__()
+        self.o_dim = o_dim
+        self.attr_dim = attr_dim
+        self.attr_clip = attr_clip
+        self.ensemble_size = ensemble_size
+        self.normalizer = None
+        
+        self.attr_func_ensemble = nn.ModuleList([
+            StateOnlyPrefTransformer(o_dim, attr_dim, d_model, nhead, num_layers)
+            for _ in range(self.ensemble_size)])
+        self.optim = [torch.optim.AdamW(ensemble.parameters(), lr=lr, weight_decay=weight_decay)
+            for ensemble in self.attr_func_ensemble]
+
+    def _predict_attr_ensemble(self, traj: torch.Tensor, ensemble_idx: int = 0):
+        '''
+        Input:
+            - traj: (batch_size, traj_len, o_dim)
+            - ensemble_idx: int
+            
+        Output:
+            - attr_strength: (batch_size, attr_dim) 
+        '''
+        traj_attr = self.attr_func_ensemble[ensemble_idx](traj)
+        attr_strength = self.attr_clip * torch.tanh(traj_attr / self.attr_clip)
+        if self.normalizer:
+            attr_strength = self.normalizer.transform(attr_strength)
+        return attr_strength
+    
+    def predict_attr(self, traj: torch.Tensor, ensemble_idx: Optional[int] = None):
+        '''
+        Input:
+            - traj: (batch_size, traj_len, o_dim)
+            - ensemble_idx: int
+            
+        Output:
+            - attr_strength: (batch_size, attr_dim) 
+        '''
+        if ensemble_idx is not None:
+            return self._predict_attr_ensemble(traj, ensemble_idx)
+        else:
+            sum_ensemble = [self._predict_attr_ensemble(traj, i) for i in range(self.ensemble_size)]
+            return sum(sum_ensemble) / self.ensemble_size
+        
+    def predict_pref_prob(self, 
+            traj0: torch.Tensor, traj1: torch.Tensor, 
+            ensemble_idx: Optional[int] = None):
+        """
+        Compute P[t_0 > t_1] = exp[sum(r(t_0))]/{exp[sum(r(t_0))]+exp[sum(r(t_1))]}= 1 /{1+exp[sum(r(t_1) - r(t_0))]}
+        ----
+        Input:
+            - traj0: (batch_size, traj_len, o_dim)
+            - traj1: (batch_size, traj_len, o_dim)
+        
+        Output:
+            - prob: (batch_size, attr_dim)
+        """
+        traj_attr_strength_0 = self.predict_attr(traj0, ensemble_idx) # (batch_size, attr_dim)
+        traj_attr_strength_1 = self.predict_attr(traj1, ensemble_idx) # (batch_size, attr_dim)
+        a1_minus_a0 = traj_attr_strength_1 - traj_attr_strength_0
+        prob = 1.0 / (1.0 + torch.exp(a1_minus_a0))
+        return prob
+    
+    def update(self, 
+            traj0: torch.Tensor, traj1: torch.Tensor, 
+            pref: torch.Tensor,
+            ensemble_idx: Optional[int] = None
+        ):
+        """
+        Update the parameters of the attribute function by minimizing the negative log-likelihood loss
+        ----
+        Input:
+            - traj0: (batch_size, traj_len, o_dim)
+            - traj1: (batch_size, traj_len, o_dim)
+            - pref: (batch_size, attr_dim) # 0 means traj0 is preferred and 1 means traj1 is preferred
+            - ensemble_idx: int # which ensemble to update
+        
+        Output:
+            - loss: float
+        """
+        prob = self.predict_pref_prob(traj0, traj1, ensemble_idx)
+        loss = - ((1-pref)*torch.log(prob+1e-8) + pref*torch.log(1-prob+1e-8)).mean()
+        self.optim[ensemble_idx].zero_grad()
+        loss.backward()
+        self.optim[ensemble_idx].step()
+        return loss.item()
+    
+    def save(self, file_directory, file_name):
+        file_path = os.path.join(file_directory, file_name)
+        if not os.path.exists(file_directory): os.makedirs(file_directory)
+        torch.save(self.state_dict(), file_path + ".pt")
+        
+    def load(self, file_directory, file_name, map_location = None):
+        file_path = os.path.join(file_directory, file_name)
+        self.load_state_dict(torch.load(file_path + ".pt", map_location=map_location))
+
+    def add_output_normalization(self, normalizer):
+        self.normalizer = normalizer
+
+class GaussianNormalizer():
+    def __init__(self, x: torch.Tensor):
+        self.mean, self.std = x.mean(0), x.std(0)
+        self.std[torch.where(self.std==0.)] = 1.
+    def normalize(self, x: torch.Tensor):
+        return (x - self.mean[None,]) / self.std[None,]
+    def unnormalize(self, x: torch.Tensor):
+        return x * self.std[None,] + self.mean[None,]
+    
+def get_episode_boundaries(dones):
+    episode_boundaries = []
+    start = 0
+    for i in range(len(dones)):
+        if dones[i] == 1 or i == (len(dones) - 1):
+            episode_boundaries.append((start, i))
+            start = i + 1
+    return episode_boundaries
+
+class MinMaxScaler():
+    def __init__(self, minimum, maximum):
+        self.minimum = minimum
+        self.maximum = maximum
+    def transform(self, x):
+        return (x - self.minimum) / (self.maximum - self.minimum)
+    
+def generate_trajectory_boundaries(n_trajectories, trajectory_length, episode_boundaries, device):
+    trajectory_boundaries = np.zeros((n_trajectories, 2), dtype=int)
+    episode_indeces = torch.randint(len(episode_boundaries), (n_trajectories,), device=device)
+    for i, episode_idx in enumerate(episode_indeces):
+        episode_start_idx, episode_end_idx = episode_boundaries[episode_idx]
+        trajectory_boundaries[i][0] = np.random.randint(episode_start_idx, episode_end_idx - trajectory_length)
+        trajectory_boundaries[i][1] = trajectory_boundaries[i][0] + trajectory_length
+    return trajectory_boundaries
+    
+# def generate_trajectory_pairs(n_trajectories, trajectory_length, episode_boundaries, device):
+#     # generate n_trajectories * 2
+#     trajectory_boundaries = []
+#     episode_indeces = torch.randint(len(episode_boundaries), (n_trajectories * 2,), device=device)
+#     for episode_idx in episode_indeces:
+#         episode_start_idx, episode_end_idx = episode_boundaries[episode_idx]
+#         trajectory_start_idx = torch.randint(episode_start_idx, episode_end_idx - trajectory_length, (1,), device=device)
+#         trajectory_end_idx = episode_start_idx + trajectory_length
+#         trajectory_boundaries.append((trajectory_start_idx, trajectory_end_idx))
+    
+#     # pair up trajectores
+#     trajectory_pairs = np.array((2, n_trajectories))
+#     for i in range(n_trajectories):
+#         trajectory_pairs[0][i] = trajectory_boundaries[2 * i][0]
+#         trajectory_pairs[1][i] = trajectory_boundaries[2 * i + 1][0]
+
+#     return trajectory_pairs
+    

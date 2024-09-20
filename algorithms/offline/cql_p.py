@@ -3,7 +3,7 @@
 # https://arxiv.org/pdf/2006.04779.pdf
 from typing import Any, Dict, List, Optional, Tuple, Union
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import os, sys
 from pathlib import Path
 import random
@@ -25,20 +25,20 @@ APP_DIR= os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 sys.path.append(APP_DIR)
 sys.path.append(APP_DIR+'/rlhf')
 
-# reward model
-from rlhf.reward_model import RewardModel, TransformerRewardModel
-from rlhf.utils import reward_from_preference
+# feedback models
+from rlhf.keypoint_prediction_model import KeypointPredictorModel
+from rlhf.utils import replace_dataset_reward, load_reward_models, load_keypoint_predictor, extend_dataset_observations
 
 
 @dataclass
 class TrainConfig:
     # Experiment
-    device: str = "cuda"
-    env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
+    device: str = "cpu"
+    env: str = "kitchen-complete-v0"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
-    eval_freq: int = int(5e3)  # How often (time steps) we evaluate
-    n_episodes: int = 10  # How many episodes run during evaluation
-    max_timesteps: int = int(1e6)  # Max time steps to run environment
+    eval_freq: int = int(1e3)  # How often (time steps) we evaluate - default int(5e3)
+    n_episodes: int = 10 # How many episodes run during evaluation - default 10
+    max_timesteps: int = int(1e6)  # Max time steps to run environment - default int(1e6)
     checkpoints_path: Optional[str] = None  # Save path
     load_model: str = ""  # Model load file name, "" doesn't load
 
@@ -75,15 +75,24 @@ class TrainConfig:
     reward_bias: float = -1.0
     policy_log_std_multiplier: float = 1.0
     # Wandb logging
-    project: str = "Uni-RLHF"
+    log_dir: str = None
+    project: str = "Uni-RLHF-CQL"
     group: str = "CQL"
     name: str = "exp"
-    reward_model_path: str = "path/to/reward_model"
-    reward_model_type: str = "mlp"
-
+    reward_model_paths: list = field(default_factory=lambda: [])
+    keypoint_predictor_path: str = ""
     def __post_init__(self):
         # self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
-        self.name = f"{self.name}-{self.env}"
+        # self.name = f"{self.name}-{self.env}"
+        model_paths = self.reward_model_paths.copy()
+        if self.keypoint_predictor_path != "":
+            model_paths.append(self.keypoint_predictor_path)
+        indicators = [self.env, self.group]
+        for model_path in model_paths:
+            file_name = os.path.splitext(os.path.basename(model_path))[0]
+            indicators.append(''.join([part.lower().capitalize() for part in file_name.split('_')]))
+        indicators.append(str(self.seed))
+        self.name = '_'.join(indicators)
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
@@ -105,10 +114,14 @@ def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
 
 def wrap_env(
     env: gym.Env,
+    keypoint_predictor: KeypointPredictorModel = None,
     state_mean: Union[np.ndarray, float] = 0.0,
     state_std: Union[np.ndarray, float] = 1.0,
     reward_scale: float = 1.0,
 ) -> gym.Env:
+    def append_keypoint_prediction(state):
+        return np.concatenate((state, keypoint_predictor.predict(state)), axis=-1)
+
     # PEP 8: E731 do not assign a lambda expression, use a def
     def normalize_state(state):
         return (
@@ -119,6 +132,8 @@ def wrap_env(
         # Please be careful, here reward is multiplied by scale!
         return reward_scale * reward
 
+    if keypoint_predictor:
+        env = gym.wrappers.TransformObservation(env, append_keypoint_prediction)
     env = gym.wrappers.TransformObservation(env, normalize_state)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward)
@@ -200,12 +215,13 @@ def set_seed(
     torch.use_deterministic_algorithms(deterministic_torch)
 
 
-def wandb_init(config: dict) -> None:
+def wandb_init(config: dict, dir=None) -> None:
     wandb.init(
         config=config,
         project=config["project"],
         group=config["group"],
         name=config["name"],
+        dir=dir,
         # id=str(uuid.uuid4()),
     )
     wandb.run.save()
@@ -851,22 +867,9 @@ def train(config: TrainConfig):
 
     dataset = d4rl.qlearning_dataset(env)
 
-    # Note: add preference here!
-    if config.reward_model_type == 'mlp':
-        reward_model = RewardModel(config.env, state_dim, action_dim, ensemble_size=3, lr=3e-4,
-                                   activation="tanh", logger=None, device=config.device)
-    elif config.reward_model_type == 'transformer':
-        reward_model = TransformerRewardModel(config.env, state_dim, action_dim, structure_type="transformer1",
-                                              ensemble_size=3, lr=0.0003, activation="tanh",
-                                              d_model=256, nhead=4, num_layers=1, max_seq_len=100,
-                                              logger=None, device=config.device)
-    else:
-        print("reward model type doesn't exist")
-    reward_model_path = config.reward_model_path
-    reward_model.load_model(reward_model_path)
-    dataset = reward_from_preference(dataset, reward_model, reward_model_type=config.reward_model_type,
-                                     device=config.device)
-
+    # update reward with trained reward models
+    reward_models, reward_model_types = load_reward_models(config.env, state_dim, action_dim, config.reward_model_paths, config.device)
+    dataset = replace_dataset_reward(dataset, reward_models, reward_model_types, device=config.device)
     if config.normalize_reward:
         modify_reward(
             dataset,
@@ -874,6 +877,13 @@ def train(config: TrainConfig):
             reward_scale=config.reward_scale,
             reward_bias=config.reward_bias,
         )
+
+    # extend observations with keypoint predictor
+    keypoint_predictor = None
+    if config.keypoint_predictor_path != "":
+        keypoint_predictor = load_keypoint_predictor(config.env, state_dim, action_dim, config.keypoint_predictor_path, config.device)
+        dataset = extend_dataset_observations(dataset, keypoint_predictor, device=config.device)
+        state_dim = state_dim * 2
 
     if config.normalize:
         state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
@@ -886,7 +896,8 @@ def train(config: TrainConfig):
     dataset["next_observations"] = normalize_states(
         dataset["next_observations"], state_mean, state_std
     )
-    env = wrap_env(env, state_mean=state_mean, state_std=state_std)
+    env = wrap_env(env, keypoint_predictor=keypoint_predictor, state_mean=state_mean, state_std=state_std)
+
     replay_buffer = ReplayBuffer(
         state_dim,
         action_dim,
@@ -970,7 +981,7 @@ def train(config: TrainConfig):
         trainer.load_state_dict(torch.load(policy_file))
         actor = trainer.actor
 
-    wandb_init(asdict(config))
+    wandb_init(asdict(config), config.log_dir)
 
     evaluations = []
     for t in range(int(config.max_timesteps)):
