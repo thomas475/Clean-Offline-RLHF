@@ -5,11 +5,11 @@
 ·
 <a href="https://arxiv.org/abs/2402.02423">Paper</a>
 ·
-<a href="">Platform</a>
+<a href="https://github.com/thomas475/Uni-RLHF-Platform">Platform</a>
 ·
 <a href="https://drive.google.com/drive/folders/1JMWyl0iAm2JJ5pOBW5M9kTOj6pJn8H3N?usp=drive_link">Datasets</a>
 ·
-<a href="https://github.com/thomas475/Uni-RLHF">Clean Offline RLHF</a>
+<a href="https://github.com/thomas475/Clean-Offline-RLHF">Clean Offline RLHF</a>
 </p>
 
 This is the official PyTorch implementation of the paper "[Uni-RLHF: Universal Platform and Benchmark Suite for Reinforcement Learning with Diverse Human Feedback](https://arxiv.org/abs/2402.02423)". Clean-Offline-RLHF is an Offline Reinforcement Learning with Human Feedback codebase that provides high-quality and realistic human feedback implementations of offline RL algorithms. 
@@ -99,15 +99,15 @@ Many of the datasets use MuJoCo as environment, so it should be installed, too. 
 
 ### Human Feedback
 
-Before using offline RLHF algorithm, you should annotate your dataset using human feedback. If you wish to collect labeled dataset to new tasks, we refer to [platform]() part for crowdsourced annotation. Here, we provide a ~15M steps crowdsourced annotation dataset for the sample task. [raw dataset](https://drive.google.com/drive/folders/1JMWyl0iAm2JJ5pOBW5M9kTOj6pJn8H3N?usp=drive_link). 
+Before using offline RLHF algorithm, you should annotate your dataset using human feedback. If you wish to collect labeled dataset to new tasks, we refer to the [platform](https://github.com/thomas475/Uni-RLHF-Platform) part for crowdsourced annotation. The already collected crowdsourced annotation datasets (~15M steps) are available [here](https://drive.google.com/drive/folders/1JMWyl0iAm2JJ5pOBW5M9kTOj6pJn8H3N?usp=drive_link). 
 
-The processed crowdsourced (CS) and scripted teacher (ST) labels are located at [crowdsource_human_labels](crowdsource_human_labels/) and [generated_fake_labels](generated_fake_labels/) folders.
+The processed crowdsourced (CS) and scripted teacher (ST) labels can be found in the [crowdsource_human_labels](crowdsource_human_labels/) and [generated_fake_labels](generated_fake_labels/) folders, respectively.
 
 Note: for comparison and validation purposes, we provide fast track for scripted teacher (ST) label generation in `fast_track/generate_d4rl_fake_labels.py`.
 
 ### Prepare Crowdsourced Data
 
-The exported labels from the Uni-RLHF-Platform have to be transformed into an approprite format first. To do this the following script (replace `[dir_path]` with the location of the raw labels):
+The exported labels from the Uni-RLHF-Platform have to be transformed into an approprite format first. To do this you can use the following script (replace `[dir_path]` with the location of the raw labels):
 ```bash
 cd scripts
 python3 transform_raw_labels.py --data_dir [dir_path]
@@ -123,7 +123,7 @@ python3 train_model.py --config config.yaml
 
 ### Train Offline RL with Pre-trained Auxiliary Models 
 
-Following Uni-RLHF codebase implemeration, we modified `IQL`, `CQL` and `TD3BC` algorithm. You can adjust the details of the experiments in the `TrainConfig` objects in the algorithm implementations found in `/algorithms/offline`, as well as in the files in the `/config` directory.
+Following the Uni-RLHF codebase implemeration, we modified the `IQL`, `CQL` and `TD3BC` algorithms. Furthermore, we added the `DiffusionQL` algorithm. You can adjust the details of the experiments in the `TrainConfig` objects in the algorithm implementations found in `/algorithms/offline`, as well as in the files in the `/config` directory.
 
 Example: Train with implicit Q-learning. The log will be uploaded to [wandb](https://wandb.ai/site).
 ```bash
@@ -132,12 +132,12 @@ python3 algorithms/offline/iql_p.py
 
 These are the possible variations of algorithms, feedback types, label types, and auxiliary model types:
 
-| Algorithm | Feedback Type | Label Type | Auxiliary Model Type |
-|-----------|---------------|------------|----------------------|
-| IQL       | COMPARATIVE   | CS         | MLP                  |
-| CQL       | ATTRIBUTE     | ST         | TFM                  |
-| TD3BC     | EVALUATIVE    |            | CNN                  |
-|           | KEYPOINT      |            |                      |
+| Algorithm   | Feedback Type | Label Type | Auxiliary Model Type |
+|-------------|---------------|------------|----------------------|
+| IQL         | COMPARATIVE   | CS         | MLP                  |
+| CQL         | ATTRIBUTE     | ST         | TFM                  |
+| TD3BC       | EVALUATIVE    |            | CNN                  |
+| DIFFUSIONQL | KEYPOINT      |            |                      |
 
 
 <!-- LICENSE -->
